@@ -3,18 +3,17 @@
 //
 // async is a fiber-based concurrency framework: an Async{} block runs a tree of
 // cooperative tasks on a reactor, and blocking operations (waiting on a child,
-// sleeping, acquiring a semaphore) suspend the running fiber back to the reactor
-// instead of blocking a thread. This package reproduces that *structured-
-// concurrency* layer — the task tree with cancellation and failure propagation,
-// plus the Async:: synchronization primitives — targeting a later rbgo binding
-// where the host VM supplies real fibers.
+// sleeping, acquiring a semaphore, reading a socket) suspend the running fiber
+// back to the reactor instead of blocking a thread. This package reproduces both
+// the *structured-concurrency* layer — the task tree with cancellation and
+// failure propagation, plus the Async:: synchronization primitives — and the
+// *IO reactor* on top of it, targeting a later rbgo binding where the host VM
+// supplies real fibers.
 //
-// # What is modelled, and what is deferred
+// # The reactor and the Scheduler seam
 //
-// async's deepest value is its non-blocking IO reactor (an epoll/kqueue/io_uring
-// event loop that resumes fibers when their sockets become ready). That IO
-// reactor is deliberately NOT ported here. Instead, the point where a fiber
-// suspends and is later resumed is expressed as an injectable Scheduler seam:
+// The point where a fiber suspends and is later resumed is expressed as an
+// injectable Scheduler seam:
 //
 //	type Scheduler interface {
 //		Defer(body func()) Fiber // spawn a fiber (a task) on the reactor
@@ -24,11 +23,25 @@
 //		Run()                    // drive the loop to quiescence
 //	}
 //
-// The rbgo binding implements Scheduler on top of the host's real fibers and a
-// timer wheel (and, eventually, the IO reactor). This package ships a
-// deterministic, in-memory CoScheduler — a cooperative scheduler with a virtual
-// clock — so the whole model is exercised with zero wall-clock sleeps and no
-// leaked goroutines, which is what keeps the test suite at 100% coverage.
+// A Scheduler that also implements IOScheduler.AwaitIO can host the non-blocking
+// IO reactor: instead of the gem's epoll/kqueue/io_uring event loop, an async IO
+// operation runs the real (blocking) Go syscall on a goroutine — Go's runtime
+// poller gives us genuine async IO natively — and parks just that one fiber
+// until the syscall completes, keeping the loop alive meanwhile. The rbgo
+// binding implements Scheduler on the host's real fibers and timer wheel. This
+// package ships a deterministic, in-memory CoScheduler — a cooperative scheduler
+// with a virtual clock plus this goroutine-backed IO reactor — so the whole
+// model is exercised with no wall-clock sleeps for the pure-cooperative paths
+// and no leaked goroutines, which is what keeps the test suite at 100% coverage.
+//
+// # Async IO
+//
+// Socket wraps a net.Conn and Listener wraps a net.Listener; their Read, Write,
+// Accept and Connect suspend the calling fiber on the reactor rather than
+// blocking a thread, and a Stop or with_timeout on the task cancels an in-flight
+// operation (via a past IO deadline, a listener close, or a dial-context cancel).
+// In-process net.Pipe and loopback TCP both work, so the reactor is exercised
+// end to end without any external network.
 //
 // # Task tree
 //
@@ -47,7 +60,8 @@
 // calling *Task (the binding passes Async::Task.current) so it can suspend the
 // right fiber and observe cancellation.
 //
-// The package is CGO-free, dependency-free, and safe under the race detector.
+// The package is CGO-free, depends only on the standard library, and is safe
+// under the race detector.
 package async
 
 import "errors"
