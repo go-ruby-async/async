@@ -25,13 +25,14 @@ type Task struct {
 	parent   *Task
 	children map[*Task]bool
 
-	body      Body
-	state     State
-	result    any
-	err       error
-	cancelErr error // non-nil once the task is asked to stop/time out
-	suspended bool  // true while parked at a blocking point
-	waiters   []*Task
+	body       Body
+	state      State
+	result     any
+	err        error
+	cancelErr  error  // non-nil once the task is asked to stop/time out
+	suspended  bool   // true while parked at a blocking point
+	onCancelIO func() // set while parked on IO: unblocks the syscall so it returns
+	waiters    []*Task
 }
 
 // Run starts a reactor and runs body as its root task, returning the root's
@@ -151,13 +152,43 @@ func (t *Task) suspend(onCancel func()) {
 // wake makes a suspended task runnable again.
 func (t *Task) wake() { t.sched.Resume(t.fiber) }
 
-// cancel records a cancellation reason and wakes the task so it unwinds at its
-// suspension point. It is only ever called on a task that is parked at a
-// blocking point (from Stop, or from a WithTimeout timer), so the wake always
-// has a suspension to resume.
+// cancel records a cancellation reason and provokes the task to unwind at its
+// suspension point. It is only ever called on a task parked at a blocking point
+// (from Stop, or from a WithTimeout timer). A task parked on IO cannot be woken
+// directly — its fiber will only be resumed once the outstanding syscall
+// returns — so cancel invokes the IO-cancel hook (which sets a past deadline or
+// closes the resource) to make that syscall return promptly; the reactor then
+// resumes the fiber, which observes cancelErr and unwinds. Otherwise cancel just
+// wakes the suspended fiber.
 func (t *Task) cancel(err error) {
 	t.cancelErr = err
+	if t.onCancelIO != nil {
+		t.onCancelIO()
+		return
+	}
 	t.wake()
+}
+
+// awaitIO parks the task on an in-flight asynchronous IO operation: op performs
+// the real (blocking) syscall on a reactor-spawned goroutine while this fiber
+// suspends, and cancel unblocks that syscall if the task is stopped or times out
+// while parked. It returns ErrNoIO when the scheduler cannot host IO; on
+// cancellation it unwinds the fiber via the usual cancelSignal, exactly like any
+// other suspension point.
+func (t *Task) awaitIO(op func(), cancel func()) error {
+	ios, ok := t.sched.(IOScheduler)
+	if !ok {
+		return ErrNoIO
+	}
+	t.suspended = true
+	t.onCancelIO = cancel
+	ios.AwaitIO(op)
+	t.suspended = false
+	t.onCancelIO = nil
+	if t.cancelErr != nil {
+		panic(cancelSignal{t.cancelErr})
+	}
+	return nil
 }
 
 // Wait joins the task, blocking the calling task until it finishes, then
